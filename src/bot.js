@@ -1,30 +1,22 @@
 'use strict';
 
-const net = require('net');
-const crypto = require('crypto');
+const net    = require('net');
+const zlib   = require('zlib');
 const { EventEmitter } = require('events');
 const { PacketReader, PacketWriter, framePacket } = require('./buffer');
 const PacketSplitter = require('./splitter');
-const HumanMovement = require('./movement');
+const HumanMovement  = require('./movement');
 
 /**
- * Supported protocol versions (newest → oldest fallback order):
- *   774 → 1.21.11
- *   773 → 1.21.9, 1.21.10
- *   772 → 1.21.7, 1.21.8
- *   771 → 1.21.6
- *   770 → 1.21.5
- *   769 → 1.21.4
- *   768 → 1.21.2, 1.21.3
- *   767 → 1.21.0, 1.21.1
+ * Protocol version map (1.21.0 – 1.21.11):
+ *   774 → 1.21.11   773 → 1.21.9/10   772 → 1.21.7/8   771 → 1.21.6
+ *   770 → 1.21.5    769 → 1.21.4      768 → 1.21.2/3   767 → 1.21.0/1
  */
-const PROTOCOL_VERSION = 774;
-const STATES = { HANDSHAKING: 0, STATUS: 1, LOGIN: 2, CONFIGURATION: 3, PLAY: 4 };
+const PROTOCOL_VERSION  = 774;
+const STATES = { HANDSHAKING:0, STATUS:1, LOGIN:2, CONFIGURATION:3, PLAY:4 };
 
-// How long to wait after "Connection throttled" before retrying (ms)
-const THROTTLE_RETRY_MS = 8000;
-// Normal reconnect delay once the protocol is locked
-const RECONNECT_MS = 5000;
+const THROTTLE_RETRY_MS = 12000; // wait after throttle kick
+const RECONNECT_MS      = 5000;  // normal reconnect delay
 
 class MinecraftBot extends EventEmitter {
   constructor(opts) {
@@ -34,55 +26,44 @@ class MinecraftBot extends EventEmitter {
     this.username = opts.username || 'FlareBot';
     this.debug    = opts.debug || false;
 
-    this._state      = STATES.HANDSHAKING;
-    this._socket     = null;
-    this._splitter   = new PacketSplitter();
-    this._movement   = new HumanMovement(this);
-    this._connected  = false;
-    this._loginAttempts = 0;
+    this._state   = STATES.HANDSHAKING;
+    this._socket  = null;
+    this._splitter = new PacketSplitter();
+    this._movement = new HumanMovement(this);
+    this._connected = false;
+    this._loginAttempts  = 0;
     this._keepAlivesSent = 0;
     this._keepAlivesRecv = 0;
+
+    // Compression state (set by Set Compression packet)
+    this._compressionThreshold = -1; // -1 = disabled
 
     // Protocol negotiation
     this._protocolFallbacks = [774, 773, 772, 771, 770, 769, 768, 767];
     this._protocolIdx       = 0;
     this.protocol           = PROTOCOL_VERSION;
-    this._protocolLocked    = false; // once true, never change protocol again
+    this._protocolLocked    = false;
 
-    // Single reconnect timer — only one reconnect can ever be pending
-    this._reconnectTimer = null;
-    // Set to true by packet handlers that want to drive the next connect()
-    // themselves, preventing socket 'close' from also scheduling one.
+    this._reconnectTimer   = null;
     this._reconnectHandled = false;
   }
 
   // ─── Logging ───────────────────────────────────────────────────────────────
 
-  log(msg)  {
-    const ts = new Date().toISOString().replace('T',' ').slice(0,19);
-    console.log(`\x1b[36m[${ts}]\x1b[0m ${msg}`);
-  }
-  warn(msg) {
-    const ts = new Date().toISOString().replace('T',' ').slice(0,19);
-    console.log(`\x1b[33m[${ts}] WARN\x1b[0m ${msg}`);
-  }
-  error(msg){
-    const ts = new Date().toISOString().replace('T',' ').slice(0,19);
-    console.log(`\x1b[31m[${ts}] ERROR\x1b[0m ${msg}`);
-  }
+  log(msg)  { console.log(`\x1b[36m[${this._ts()}]\x1b[0m ${msg}`); }
+  warn(msg) { console.log(`\x1b[33m[${this._ts()}] WARN\x1b[0m ${msg}`); }
+  error(msg){ console.log(`\x1b[31m[${this._ts()}] ERROR\x1b[0m ${msg}`); }
+  _ts()     { return new Date().toISOString().replace('T',' ').slice(0,19); }
 
   // ─── Connection management ─────────────────────────────────────────────────
 
   connect() {
-    // Clear any pending reconnect before opening a new socket
-    if (this._reconnectTimer) {
-      clearTimeout(this._reconnectTimer);
-      this._reconnectTimer = null;
-    }
+    if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
 
     this._loginAttempts++;
-    this._reconnectHandled = false;
-    this._state    = STATES.HANDSHAKING;
+    this._reconnectHandled    = false;
+    this._compressionThreshold = -1;  // reset per-connection
+    this._state   = STATES.HANDSHAKING;
     this._splitter = new PacketSplitter();
     this._movement.stop();
 
@@ -103,49 +84,110 @@ class MinecraftBot extends EventEmitter {
 
     socket.on('data', chunk => this._splitter.push(chunk));
 
+    // Splitter gives us length-stripped raw frames.
+    // If compression is active, each frame is: [dataLen VarInt][payload]
+    // where dataLen=0 means uncompressed, dataLen>0 means zlib payload.
     this._splitter.on('packet', raw => {
-      try { this._handleRaw(raw); }
-      catch (e) { this.warn(`Packet handling error: ${e.message}\n${e.stack}`); }
+      try { this._handleFrame(raw); }
+      catch (e) { this.warn(`Packet error: ${e.message}`); if (this.debug) console.error(e.stack); }
     });
 
-    socket.on('error', err => {
-      this.error(`Socket error: ${err.message}`);
-    });
+    socket.on('error', err => this.error(`Socket error: ${err.message}`));
 
     socket.on('close', () => {
       this._connected = false;
       this._movement.stop();
-      // Only schedule a reconnect here if the packet handler didn't already do it
       if (!this._reconnectHandled) {
-        this.log(`Disconnected. Reconnecting in ${RECONNECT_MS / 1000}s…`);
+        this.log(`Disconnected. Reconnecting in ${RECONNECT_MS/1000}s…`);
         this._scheduleReconnect(RECONNECT_MS);
       }
     });
   }
 
-  _scheduleReconnect(delayMs) {
-    if (this._reconnectTimer) return; // already pending
-    this._reconnectTimer = setTimeout(() => {
-      this._reconnectTimer = null;
-      this.connect();
-    }, delayMs);
+  _scheduleReconnect(ms) {
+    if (this._reconnectTimer) return;
+    this._reconnectTimer = setTimeout(() => { this._reconnectTimer = null; this.connect(); }, ms);
   }
 
-  /** Destroy socket and schedule next connect, preventing the close handler from also doing it */
-  _reconnectAfter(delayMs, logMsg) {
-    this._reconnectHandled = true; // tell close handler to stand down
-    if (logMsg) this.log(logMsg);
+  _reconnectAfter(ms, msg) {
+    this._reconnectHandled = true;
+    if (msg) this.log(msg);
     this._socket.destroy();
-    this._scheduleReconnect(delayMs);
+    this._scheduleReconnect(ms);
+  }
+
+  // ─── Compression-aware frame handler ──────────────────────────────────────
+
+  _handleFrame(raw) {
+    let payload;
+
+    if (this._compressionThreshold >= 0) {
+      // Compressed mode: [dataLen VarInt][data]
+      const r = new PacketReader(raw);
+      const dataLen = r.readVarInt();
+      const data    = r.readBytes(r.remaining);
+
+      if (dataLen === 0) {
+        // Uncompressed (packet was below threshold)
+        payload = data;
+      } else {
+        // Compressed — synchronous inflate
+        try {
+          payload = zlib.inflateSync(data);
+        } catch (e) {
+          this.warn(`zlib inflate failed: ${e.message}`);
+          return;
+        }
+      }
+    } else {
+      // No compression — raw is just [packetId VarInt][payload]
+      payload = raw;
+    }
+
+    const r = new PacketReader(payload);
+    const id = r.readVarInt();
+    if (this.debug) this.log(`  ← 0x${id.toString(16).padStart(2,'0')} [${Object.keys(STATES)[this._state]}]${this._compressionThreshold>=0?' (compressed)':''}`);
+
+    switch (this._state) {
+      case STATES.LOGIN:         return this._handleLogin(id, r);
+      case STATES.CONFIGURATION: return this._handleConfig(id, r);
+      case STATES.PLAY:          return this._handlePlay(id, r);
+    }
   }
 
   // ─── Packet sending ────────────────────────────────────────────────────────
 
   _send(packetId, writer) {
     if (!this._socket || !this._connected) return;
-    const frame = framePacket(packetId, writer.toBuffer());
+
+    const payload = writer.toBuffer();
+    let frame;
+
+    if (this._compressionThreshold >= 0) {
+      // Build compression-mode packet: [packetId][payload] optionally compressed
+      const inner = Buffer.concat([this._varIntBuf(packetId), payload]);
+      if (inner.length >= this._compressionThreshold) {
+        const compressed = zlib.deflateSync(inner);
+        const lenBuf = this._varIntBuf(inner.length); // dataLen = uncompressed size
+        const outer  = Buffer.concat([lenBuf, compressed]);
+        frame = Buffer.concat([this._varIntBuf(outer.length), outer]);
+      } else {
+        // Below threshold: dataLen = 0
+        const outer = Buffer.concat([Buffer.from([0x00]), inner]);
+        frame = Buffer.concat([this._varIntBuf(outer.length), outer]);
+      }
+    } else {
+      frame = framePacket(packetId, payload);
+    }
+
     if (this.debug) this.log(`  → 0x${packetId.toString(16).padStart(2,'0')} (${frame.length}b)`);
     this._socket.write(frame);
+  }
+
+  _varIntBuf(val) {
+    const w = new PacketWriter();
+    w.writeVarInt(val);
+    return w.toBuffer();
   }
 
   _sendHandshake() {
@@ -153,7 +195,7 @@ class MinecraftBot extends EventEmitter {
     w.writeVarInt(this.protocol);
     w.writeString(this.host);
     w.writeUShort(this.port);
-    w.writeVarInt(2); // next state: login
+    w.writeVarInt(2);
     this._send(0x00, w);
     this._state = STATES.LOGIN;
   }
@@ -174,17 +216,32 @@ class MinecraftBot extends EventEmitter {
     this._send(0x1B, w);
   }
 
-  // ─── Packet dispatch ───────────────────────────────────────────────────────
+  // ─── Disconnect reason parser ─────────────────────────────────────────────
+  // MC 1.20.3+ sends disconnect reason as an NBT Text Component, not a plain
+  // JSON string. We handle both formats and extract plain text from either.
 
-  _handleRaw(raw) {
-    const reader = new PacketReader(raw);
-    const id = reader.readVarInt();
-    if (this.debug) this.log(`  ← 0x${id.toString(16).padStart(2,'0')} [${Object.keys(STATES)[this._state]}]`);
-    switch (this._state) {
-      case STATES.LOGIN:         return this._handleLogin(id, reader);
-      case STATES.CONFIGURATION: return this._handleConfig(id, reader);
-      case STATES.PLAY:          return this._handlePlay(id, reader);
-    }
+  _parseDisconnectReason(r) {
+    // Try to read as a standard MC String (VarInt length prefix + UTF8)
+    // In pre-1.20.3: it's a JSON string like {"text":"..."}
+    // In 1.20.3+: it's an NBT-encoded Text Component
+    //
+    // We attempt JSON parse first. If that fails we do a best-effort
+    // extraction of any readable text from the buffer.
+    const raw = r.readString();
+
+    // Attempt JSON
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed === 'string') return parsed;
+      if (parsed && typeof parsed.text === 'string') return parsed.text;
+      if (parsed && Array.isArray(parsed.extra)) {
+        return (parsed.text || '') + parsed.extra.map(e => e.text || '').join('');
+      }
+      return raw;
+    } catch (_) {}
+
+    // Return raw string as-is (may be NBT bytes rendered as string, or just text)
+    return raw;
   }
 
   // ── LOGIN ──────────────────────────────────────────────────────────────────
@@ -200,83 +257,72 @@ class MinecraftBot extends EventEmitter {
   }
 
   _onLoginDisconnect(r) {
-    const reason = r.readString();
+    const reason = this._parseDisconnectReason(r);
     this.error(`Login disconnected: ${reason}`);
 
-    // ── Throttle: server is rate-limiting us ──────────────────────────────
-    // This is NOT a version mismatch. Lock the current protocol (if we already
-    // found the right one) and wait before retrying — don't blast through the
-    // fallback list.
-    if (/throttl/i.test(reason)) {
-      if (!this._protocolLocked && this._protocolIdx > 0) {
-        // We already successfully identified the version last attempt.
-        // The correct protocol is the current one — lock it.
-        this._protocolLocked = true;
-        this.warn(`Throttled. Protocol ${this.protocol} locked in. Waiting ${THROTTLE_RETRY_MS/1000}s…`);
-      } else if (this._protocolLocked) {
+    // Throttle — DO NOT change protocol, just wait
+    if (/throttl/i.test(reason) || reason === '/' || reason.length <= 2) {
+      // '/' or short garbage = likely throttle with compressed/NBT packet we
+      // couldn't fully parse, or Aternos's minimal throttle response.
+      const isThrottle = /throttl/i.test(reason) || reason.length <= 2;
+      if (isThrottle) {
+        this._protocolLocked = true; // lock whatever we have
         this.warn(`Throttled (protocol ${this.protocol} locked). Waiting ${THROTTLE_RETRY_MS/1000}s…`);
-      } else {
-        // Throttled before we even negotiated a version — just wait and retry same protocol
-        this.warn(`Throttled before version negotiation. Waiting ${THROTTLE_RETRY_MS/1000}s…`);
+        this._reconnectAfter(THROTTLE_RETRY_MS);
+        return;
       }
-      this._reconnectAfter(THROTTLE_RETRY_MS);
-      return;
     }
 
-    // ── Version mismatch: parse the MC version from the kick message ──────
-    // Handles both:
-    //   "Outdated client! Please use 1.21.8"
-    //   "Outdated server! I'm still on 1.21.4"
-    const versionMatch = reason.match(/1\.21\.(\d+)/);
-    if (versionMatch) {
-      const mcMinor = parseInt(versionMatch[1], 10);
-      const target  = this._mcVersionToProtocol(mcMinor);
+    // Version mismatch — jump straight to the right protocol
+    const m = reason.match(/1\.21\.(\d+)/);
+    if (m) {
+      const target = this._mcVersionToProtocol(parseInt(m[1], 10));
       if (target) {
-        this.warn(`Server is on 1.21.${mcMinor} → jumping to protocol ${target}`);
-        this.protocol      = target;
-        this._protocolIdx  = this._protocolFallbacks.indexOf(target);
-        if (this._protocolIdx === -1) this._protocolIdx = 0;
+        this.warn(`Server is on 1.21.${m[1]} → jumping to protocol ${target}`);
+        this.protocol     = target;
+        this._protocolIdx = this._protocolFallbacks.indexOf(target);
+        if (this._protocolIdx < 0) this._protocolIdx = 0;
         this._reconnectAfter(1500);
         return;
       }
     }
 
-    // ── Generic version mismatch / unknown kick: step down one protocol ───
+    // Unknown kick — if locked just reconnect, else step down
     this._stepProtocolDown();
   }
 
-  /** Map a 1.21.x minor version number to its protocol number */
   _mcVersionToProtocol(minor) {
-    const map = { 0:767, 1:767, 2:768, 3:768, 4:769, 5:770, 6:771, 7:772, 8:772, 9:773, 10:773, 11:774 };
+    const map = { 0:767,1:767,2:768,3:768,4:769,5:770,6:771,7:772,8:772,9:773,10:773,11:774 };
     return map[minor] ?? null;
   }
 
-  /** Step down one protocol in the fallback list, or give up and reset */
   _stepProtocolDown() {
     if (this._protocolLocked) {
-      // Protocol is locked — just reconnect with the same one
-      this._reconnectAfter(RECONNECT_MS, `Reconnecting with locked protocol ${this.protocol}…`);
+      this._reconnectAfter(RECONNECT_MS, `Reconnecting (protocol ${this.protocol} locked)…`);
       return;
     }
-
     this._protocolIdx++;
     if (this._protocolIdx < this._protocolFallbacks.length) {
       this.protocol = this._protocolFallbacks[this._protocolIdx];
-      this.warn(`Trying protocol version ${this.protocol}…`);
+      this.warn(`Trying protocol ${this.protocol}…`);
       this._reconnectAfter(1500);
     } else {
-      this.error('All protocol versions exhausted. Waiting 15s before retrying from top…');
+      this.error('All protocols exhausted. Waiting 15s…');
       this._protocolIdx = 0;
       this.protocol = this._protocolFallbacks[0];
       this._reconnectAfter(15000);
     }
   }
 
+  _onSetCompression(r) {
+    const threshold = r.readVarInt();
+    this._compressionThreshold = threshold;
+    this.log(`Compression enabled (threshold: ${threshold} bytes)`);
+  }
+
   _onEncryptionRequest(r) {
-    r.readString();           // serverId
-    r.readBytes(r.readVarInt()); // pubKey
-    r.readBytes(r.readVarInt()); // verifyToken
-    this.warn('Server requires online-mode encryption — this bot only supports offline-mode servers.');
+    r.readString(); r.readBytes(r.readVarInt()); r.readBytes(r.readVarInt());
+    this.warn('Server requires online-mode — bot only supports offline-mode servers.');
     this._reconnectAfter(30000, 'Pausing 30s (online-mode server)…');
   }
 
@@ -288,8 +334,6 @@ class MinecraftBot extends EventEmitter {
       r.readString(); r.readString();
       if (r.readBoolean()) r.readString();
     }
-
-    // ✅ Login succeeded — lock the protocol forever
     if (!this._protocolLocked) {
       this._protocolLocked = true;
       this.log(`\x1b[32mLogin success!\x1b[0m UUID=${uuid} Name=${username} — protocol ${this.protocol} \x1b[32mlocked\x1b[0m`);
@@ -297,23 +341,15 @@ class MinecraftBot extends EventEmitter {
       this.log(`\x1b[32mLogin success!\x1b[0m UUID=${uuid} Name=${username}`);
     }
     this._loginAttempts = 0;
-
     this._send(0x03, new PacketWriter()); // Login Acknowledged
     this._state = STATES.CONFIGURATION;
     this.log('State → CONFIGURATION');
   }
 
-  _onSetCompression(r) {
-    const threshold = r.readVarInt();
-    if (this.debug) this.log(`Set compression threshold: ${threshold} (not implemented)`);
-  }
-
   _onLoginPluginRequest(r) {
-    const messageId = r.readVarInt();
-    r.readString(); // channel
+    const messageId = r.readVarInt(); r.readString();
     const w = new PacketWriter();
-    w.writeVarInt(messageId);
-    w.writeBoolean(false);
+    w.writeVarInt(messageId).writeBoolean(false);
     this._send(0x02, w);
   }
 
@@ -329,7 +365,6 @@ class MinecraftBot extends EventEmitter {
       case 0x05: return this._onConfigPing(r);
       case 0x07: return; // Registry data — ignore
       case 0x0E: return this._onKnownPacks(r);
-      // silently ignore everything else
     }
   }
 
@@ -342,60 +377,49 @@ class MinecraftBot extends EventEmitter {
 
   _onConfigPluginMessage(r) {
     const channel = r.readString();
-    if (this.debug) this.log(`  Config plugin message: ${channel}`);
+    if (this.debug) this.log(`  Plugin message: ${channel}`);
     if (channel === 'minecraft:brand') {
       const w = new PacketWriter();
-      w.writeString('minecraft:brand');
-      w.writeBytes(Buffer.from('\x06Flare'));
+      w.writeString('minecraft:brand').writeBytes(Buffer.from('\x06Flare'));
       this._send(0x00, w);
     }
   }
 
   _onConfigDisconnect(r) {
-    this.error(`Configuration disconnect: ${r.readString()}`);
+    this.error(`Config disconnect: ${this._parseDisconnectReason(r)}`);
     this._reconnectAfter(RECONNECT_MS);
   }
 
   _onConfigFinish(r) {
-    this.log('Config finish → sending client info + finish');
+    this.log('Config finish → PLAY');
     this._sendClientInformation(true);
-    this._send(0x03, new PacketWriter()); // Finish Configuration
+    this._send(0x03, new PacketWriter());
     this._state = STATES.PLAY;
-    this.log('State → PLAY');
     this.emit('spawn');
   }
 
   _onConfigKeepAlive(r) {
     const id = r.readLong();
-    const w = new PacketWriter();
-    w.writeLong(id);
-    this._send(0x04, w);
-    this._keepAlivesSent++;
+    const w = new PacketWriter(); w.writeLong(id);
+    this._send(0x04, w); this._keepAlivesSent++;
   }
 
   _onConfigPing(r) {
     const id = r.readInt();
-    const w = new PacketWriter();
-    w.writeInt(id);
+    const w = new PacketWriter(); w.writeInt(id);
     this._send(0x05, w);
   }
 
   _onKnownPacks(r) {
-    const w = new PacketWriter();
-    w.writeVarInt(0); // 0 known packs
+    const w = new PacketWriter(); w.writeVarInt(0);
     this._send(0x07, w);
   }
 
   _sendClientInformation(inConfig = false) {
     const w = new PacketWriter();
-    w.writeString('en_us');
-    w.writeByte(8);           // view distance
-    w.writeVarInt(0);         // chat mode: enabled
-    w.writeBoolean(true);     // chat colors
-    w.writeByte(0x7F);        // all skin parts
-    w.writeVarInt(1);         // main hand: right
-    w.writeBoolean(false);    // text filtering
-    w.writeBoolean(true);     // server listings
+    w.writeString('en_us').writeByte(8).writeVarInt(0)
+     .writeBoolean(true).writeByte(0x7F).writeVarInt(1)
+     .writeBoolean(false).writeBoolean(true);
     this._send(inConfig ? 0x00 : 0x0A, w);
   }
 
@@ -413,23 +437,20 @@ class MinecraftBot extends EventEmitter {
   }
 
   _onPlayDisconnect(r) {
-    this.error(`Play disconnect: ${r.readString()}`);
+    this.error(`Play disconnect: ${this._parseDisconnectReason(r)}`);
     this._reconnectAfter(RECONNECT_MS);
   }
 
   _onPlayKeepAlive(r) {
     const id = r.readLong();
-    const w = new PacketWriter();
-    w.writeLong(id);
+    const w = new PacketWriter(); w.writeLong(id);
     this._send(0x18, w);
-    this._keepAlivesSent++;
-    this._keepAlivesRecv++;
+    this._keepAlivesSent++; this._keepAlivesRecv++;
     if (this.debug) this.log(`  KeepAlive ↔ ${id}`);
   }
 
   _onPlayLogin(r) {
-    const entityId = r.readInt();
-    r.readBoolean(); // hardcore
+    const entityId = r.readInt(); r.readBoolean();
     const dimCount = r.readVarInt();
     for (let i = 0; i < dimCount; i++) r.readString();
     const maxPlayers = r.readVarInt();
@@ -439,29 +460,20 @@ class MinecraftBot extends EventEmitter {
 
   _onPlayPing(r) {
     const id = r.readInt();
-    const w = new PacketWriter();
-    w.writeInt(id);
+    const w = new PacketWriter(); w.writeInt(id);
     this._send(0x36, w);
   }
 
   _onSynchronizePosition(r) {
-    const x    = r.readDouble();
-    const y    = r.readDouble();
-    const z    = r.readDouble();
-    const yaw  = r.readFloat();
-    const pitch= r.readFloat();
-    r.readByte(); // flags
+    const x = r.readDouble(), y = r.readDouble(), z = r.readDouble();
+    const yaw = r.readFloat(), pitch = r.readFloat();
+    r.readByte();
     const teleportId = r.readVarInt();
-
     this.log(`Teleport → (${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)}) yaw=${yaw.toFixed(1)}`);
-
-    const w = new PacketWriter();
-    w.writeVarInt(teleportId);
-    this._send(0x00, w); // Confirm Teleport
-
+    const w = new PacketWriter(); w.writeVarInt(teleportId);
+    this._send(0x00, w);
     this._movement.setSpawn(x, y, z);
-    this._movement.yaw   = yaw;
-    this._movement.pitch = pitch;
+    this._movement.yaw = yaw; this._movement.pitch = pitch;
     if (!this._movement._tickInterval) this._movement.start();
   }
 }
