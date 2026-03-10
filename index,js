@@ -1,0 +1,99 @@
+'use strict';
+
+require('dotenv').config();
+
+const MinecraftBot = require('./src/bot');
+
+// ─── Configuration from environment ──────────────────────────────────────────
+
+const SERVER_HOST = process.env.MC_HOST;
+const SERVER_PORT = parseInt(process.env.MC_PORT || '25565', 10);
+const BOT_NAME    = process.env.BOT_NAME || 'FlareBot';
+const DEBUG       = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
+
+if (!SERVER_HOST) {
+  console.error('\x1b[31m[FlareSign Keep-Alive] MC_HOST env variable is required!\x1b[0m');
+  console.error('  Usage: MC_HOST=your.server.com BOT_NAME=CoolBot node index.js');
+  console.error('  Or create a .env file (see .env.example)');
+  process.exit(1);
+}
+
+// ─── Banner ───────────────────────────────────────────────────────────────────
+
+console.log('\x1b[38;5;208m');
+console.log('  ███████╗██╗      █████╗ ██████╗ ███████╗');
+console.log('  ██╔════╝██║     ██╔══██╗██╔══██╗██╔════╝');
+console.log('  █████╗  ██║     ███████║██████╔╝█████╗  ');
+console.log('  ██╔══╝  ██║     ██╔══██║██╔══██╗██╔══╝  ');
+console.log('  ██║     ███████╗██║  ██║██║  ██║███████╗');
+console.log('  ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝');
+console.log('\x1b[38;5;196m');
+console.log('  ███████╗██╗ ██████╗ ███╗   ██╗');
+console.log('  ██╔════╝██║██╔════╝ ████╗  ██║');
+console.log('  ███████╗██║██║  ███╗██╔██╗ ██║');
+console.log('  ╚════██║██║██║   ██║██║╚██╗██║');
+console.log('  ███████║██║╚██████╔╝██║ ╚████║');
+console.log('  ╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝');
+console.log('\x1b[0m');
+console.log('\x1b[90m  Minecraft Keep-Alive Bot — 1.21.0 → 1.21.4\x1b[0m');
+console.log('\x1b[90m  No Mineflayer. Pure protocol implementation.\x1b[0m');
+console.log('');
+console.log(`  \x1b[36mServer :\x1b[0m ${SERVER_HOST}:${SERVER_PORT}`);
+console.log(`  \x1b[36mBot    :\x1b[0m ${BOT_NAME}`);
+console.log(`  \x1b[36mDebug  :\x1b[0m ${DEBUG ? '\x1b[33mON\x1b[0m' : 'OFF'}`);
+console.log('');
+
+// ─── Stats display ────────────────────────────────────────────────────────────
+
+function printStats(bot) {
+  setInterval(() => {
+    if (!bot._connected) return;
+    const pos = bot._movement;
+    const uptime = process.uptime();
+    const h = Math.floor(uptime / 3600);
+    const m = Math.floor((uptime % 3600) / 60);
+    const s = Math.floor(uptime % 60);
+    const uptimeStr = `${h}h ${m}m ${s}s`;
+    const state = Object.keys({ HANDSHAKING:0, STATUS:1, LOGIN:2, CONFIGURATION:3, PLAY:4 })[bot._state];
+    process.stdout.write(
+      `\r\x1b[90m[Stats]\x1b[0m State=\x1b[32m${state}\x1b[0m | ` +
+      `Pos=(${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}) | ` +
+      `KA sent/recv=\x1b[36m${bot._keepAlivesSent}/${bot._keepAlivesRecv}\x1b[0m | ` +
+      `Uptime=\x1b[33m${uptimeStr}\x1b[0m   `
+    );
+  }, 2000);
+}
+
+// ─── Boot ─────────────────────────────────────────────────────────────────────
+
+const bot = new MinecraftBot({
+  host:     SERVER_HOST,
+  port:     SERVER_PORT,
+  username: BOT_NAME,
+  debug:    DEBUG,
+});
+
+bot.on('spawn', () => {
+  bot.log('\x1b[32m✔ Bot is in-game and moving!\x1b[0m');
+});
+
+printStats(bot);
+bot.connect();
+
+// ─── Graceful shutdown ────────────────────────────────────────────────────────
+
+process.on('SIGINT', () => {
+  console.log('\n\x1b[33m[FlareSign] Shutting down gracefully…\x1b[0m');
+  bot._movement.stop();
+  if (bot._socket) bot._socket.destroy();
+  process.exit(0);
+});
+
+process.on('uncaughtException', err => {
+  bot.error(`Uncaught exception: ${err.message}`);
+  // Don't crash — let the reconnect logic handle it
+});
+
+process.on('unhandledRejection', (reason) => {
+  bot.error(`Unhandled rejection: ${reason}`);
+});
