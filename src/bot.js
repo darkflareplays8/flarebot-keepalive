@@ -179,8 +179,34 @@ class MinecraftBot extends EventEmitter {
   _onLoginDisconnect(r) {
     const reason = r.readString();
     this.error(`Login disconnected: ${reason}`);
-    // Try next protocol version
+
+    // MC sends kick messages like:
+    //   'Outdated client! Please use 1.21.8'
+    //   'Outdated server! I'm still on 1.21.4'
+    // Parse the version and jump straight to the correct protocol instead of
+    // blindly stepping down one-by-one.
+    const versionMatch = reason.match(/1\.21\.(\d+)/);
+    if (versionMatch) {
+      const mcMinor = parseInt(versionMatch[1], 10);
+      const target  = this._mcVersionToProtocol(mcMinor);
+      if (target && target !== this.protocol) {
+        this.warn(`Server is on 1.21.${mcMinor} → jumping straight to protocol ${target}`);
+        this._socket.destroy();
+        this.protocol     = target;
+        this._protocolIdx = this._protocolFallbacks.indexOf(target);
+        if (this._protocolIdx === -1) this._protocolIdx = 0;
+        setTimeout(() => this.connect(), 1000);
+        return;
+      }
+    }
+
     this._tryNextProtocol();
+  }
+
+  /** Map a 1.21.x minor version to its protocol number */
+  _mcVersionToProtocol(minor) {
+    const map = { 0:767, 1:767, 2:768, 3:768, 4:769, 5:770, 6:771, 7:772, 8:772, 9:773, 10:773, 11:774 };
+    return map[minor] ?? null;
   }
 
   _onEncryptionRequest(r) {
