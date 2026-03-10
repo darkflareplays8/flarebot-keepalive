@@ -8,12 +8,17 @@ const PacketSplitter = require('./splitter');
 const HumanMovement = require('./movement');
 
 /**
- * Supported protocol versions:
- *   767 → 1.21.0 / 1.21.1
- *   768 → 1.21.2 / 1.21.3
+ * Supported protocol versions (newest → oldest fallback order):
+ *   774 → 1.21.11
+ *   773 → 1.21.9, 1.21.10
+ *   772 → 1.21.7, 1.21.8
+ *   771 → 1.21.6
+ *   770 → 1.21.5
  *   769 → 1.21.4
+ *   768 → 1.21.2, 1.21.3
+ *   767 → 1.21.0, 1.21.1
  */
-const PROTOCOL_VERSION = 769; // Try 769 first; we fall back via server's disconnect
+const PROTOCOL_VERSION = 774; // Start at newest, fall back automatically on rejection
 
 const STATES = { HANDSHAKING: 0, STATUS: 1, LOGIN: 2, CONFIGURATION: 3, PLAY: 4 };
 
@@ -37,8 +42,8 @@ class MinecraftBot extends EventEmitter {
     this._keepAlivesRecv = 0;
     this._loginAttempts  = 0;
 
-    // We'll try these protocol versions in order if kicked
-    this._protocolFallbacks = [769, 768, 767];
+    // Try newest protocol first, fall back on rejection (covers all 1.21.0–1.21.11)
+    this._protocolFallbacks = [774, 773, 772, 771, 770, 769, 768, 767];
     this._protocolIdx       = 0;
   }
 
