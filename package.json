@@ -1,0 +1,20 @@
+{
+  "name": "mc-keepalive",
+  "version": "1.0.0",
+  "description": "Custom Minecraft 1.21.x keep-alive bot with human-like movement. No mineflayer.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "minecraft-data": "^3.68.0",
+    "prismarine-chat": "^1.11.0",
+    "node-rsa": "^1.1.1",
+    "uuid": "^9.0.0",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
