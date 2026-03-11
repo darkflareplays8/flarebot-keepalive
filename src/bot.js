@@ -14,8 +14,10 @@ const HumanMovement  = require('./movement');
  */
 const PROTOCOL_VERSION = 774;
 const STATES = { HANDSHAKING:0, STATUS:1, LOGIN:2, CONFIGURATION:3, PLAY:4 };
-const THROTTLE_RETRY_MS = 12000;
-const RECONNECT_MS      = 5000;
+const THROTTLE_RETRY_MS  = 12000;
+const RECONNECT_MS_BASE  = 5000;
+const RECONNECT_MS_MAX   = 5 * 60 * 1000; // 5 minutes
+const OFFLINE_THRESHOLD_MS = 2000; // connect→close in under this = server offline
 
 // ─── NBT Text Component parser ─────────────────────────────────────────────────
 // MC 1.20.3+ sends disconnect reasons as NBT, not JSON strings.
@@ -145,6 +147,8 @@ class MinecraftBot extends EventEmitter {
     this._protocolLocked     = false;
 
     this._reconnectTimer     = null;
+    this._backoffMs          = RECONNECT_MS_BASE;
+    this._connectTime        = 0;
   }
 
   log(msg)  { console.log(`\x1b[36m[${this._ts()}]\x1b[0m ${msg}`); }
@@ -186,7 +190,8 @@ class MinecraftBot extends EventEmitter {
     socket.on('connect', () => {
       if (socket !== this._activeSocket) return;
       this._connected = true;
-      this.log('TCP connected → sending handshake');
+      this._connectTime = Date.now();
+      this.log('TCP connected \u2192 sending handshake');
       this._sendHandshake();
       this._sendLoginStart();
     });
@@ -211,8 +216,16 @@ class MinecraftBot extends EventEmitter {
       if (socket !== this._activeSocket) return;
       this._connected = false;
       this._movement.stop();
-      this.log(`Disconnected. Reconnecting in ${RECONNECT_MS/1000}s…`);
-      this._scheduleReconnect(RECONNECT_MS);
+      const elapsed = Date.now() - this._connectTime;
+      const serverOffline = elapsed < OFFLINE_THRESHOLD_MS;
+      if (serverOffline) {
+        this._backoffMs = Math.min(this._backoffMs * 2, RECONNECT_MS_MAX);
+        this.log(`Server appears offline. Backing off \u2014 next attempt in ${this._backoffMs / 1000}s\u2026`);
+      } else {
+        this._backoffMs = RECONNECT_MS_BASE;
+        this.log(`Disconnected. Reconnecting in ${RECONNECT_MS_BASE / 1000}s\u2026`);
+      }
+      this._scheduleReconnect(this._backoffMs);
     });
   }
 
@@ -389,7 +402,7 @@ class MinecraftBot extends EventEmitter {
 
   _stepProtocolDown() {
     if (this._protocolLocked) {
-      this._reconnectAfter(RECONNECT_MS);
+      this._reconnectAfter(RECONNECT_MS_BASE);
       return;
     }
     this._protocolIdx++;
@@ -432,6 +445,7 @@ class MinecraftBot extends EventEmitter {
       this.log(`\x1b[32mLogin success!\x1b[0m UUID=${uuid} Name=${username}`);
     }
     this._loginAttempts = 0;
+    this._backoffMs     = RECONNECT_MS_BASE;
     this._send(0x03, new PacketWriter()); // Login Acknowledged
     this._state = STATES.CONFIGURATION;
     this.log('State → CONFIGURATION');
@@ -486,7 +500,7 @@ class MinecraftBot extends EventEmitter {
       this._reconnectAfter(10000);
       return;
     }
-    this._reconnectAfter(RECONNECT_MS);
+    this._reconnectAfter(RECONNECT_MS_BASE);
   }
 
   _onConfigFinish(r) {
@@ -538,7 +552,7 @@ class MinecraftBot extends EventEmitter {
   _onPlayDisconnect(r) {
     const reason = this._readDisconnectReason(r);
     this.error(`Play disconnect: ${reason}`);
-    this._reconnectAfter(RECONNECT_MS);
+    this._reconnectAfter(RECONNECT_MS_BASE);
   }
 
   _onPlayKeepAlive(r) {
