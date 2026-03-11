@@ -324,11 +324,12 @@ class MinecraftBot extends EventEmitter {
 
   // ─── Disconnect reason: handles JSON string and NBT text component ─────────
 
-  _readDisconnectReason(r) {
-    // In MC < 1.20.3: reason is a MC String (varint-prefixed UTF8 JSON)
-    // In MC >= 1.20.3: reason is an NBT Text Component (raw NBT bytes, no length prefix at the packet level —
-    //   but it IS still read as a MC String in the Login Disconnect packet per wiki.vg 1.20.3+ spec)
-    // So readString() gets us bytes that might be JSON or might be raw NBT.
+  _readDisconnectReason(r, rawNbt = false) {
+    if (rawNbt) {
+      const buf = r.readBytes(r.remaining);
+      if (this.debug) this.log(`  Disconnect NBT hex: ${buf.toString('hex')}`);
+      return extractNbtText(buf);
+    }
     const raw = r.readString();
 
     // Try JSON first (covers older servers and some messages)
@@ -491,7 +492,7 @@ class MinecraftBot extends EventEmitter {
   }
 
   _onConfigDisconnect(r) {
-    const reason = this._readDisconnectReason(r);
+    const reason = this._readDisconnectReason(r, true);
     this.error(`Config disconnect: ${reason}`);
 
     // "You are already connected" — we have a stale connection, wait longer
@@ -550,7 +551,7 @@ class MinecraftBot extends EventEmitter {
   }
 
   _onPlayDisconnect(r) {
-    const reason = this._readDisconnectReason(r);
+    const reason = this._readDisconnectReason(r, true);
     this.error(`Play disconnect: ${reason}`);
     this._reconnectAfter(RECONNECT_MS_BASE);
   }
